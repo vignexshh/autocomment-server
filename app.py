@@ -7,12 +7,29 @@ import json
 import requests
 import os
 from dotenv import load_dotenv
+
+from motor.motor_asyncio import AsyncIOMotorClient
+import pymongo
+import aiohttp
+
+
+# Add MongoDB connection
+MONGODB_URL = os.getenv("MONGODB_URL")
+DATABASE_NAME = os.getenv("DATABASE_NAME", "autocomment")
+COLLECTION_NAME = "channel_connections"
+
+# Initialize MongoDB client
+mongo_client = AsyncIOMotorClient(MONGODB_URL)
+database = mongo_client[DATABASE_NAME]
+collection = database[COLLECTION_NAME]
+
+
 load_dotenv('creds/.env.local')
 
 app  = FastAPI()
 
 
-credentials_path = os.getenv('GCP_CREDS_PATH') # Ensure this env variable is set
+credentials_path =r'C:\Users\vigne\codes\autocomment-backend\creds\arctic-depth-466609-i0-be97ce7e244d.json'
 credentials = service_account.Credentials.from_service_account_file(credentials_path)
 async_client = secretmanager.SecretManagerServiceClient(credentials=credentials)
 
@@ -108,6 +125,25 @@ async def store_token_in_secret_manager(project_id, secret_id, access_token, ref
                 }
             )
             print(f"Created secret and added version: {response.name}")
+
+            try:
+                # Get channel details first
+                channel_details = await get_youtube_channel_details_public(secret_id)
+                
+                connection_document = {
+                    "channel_id": secret_id,
+                    "connectionCreatedOn": datetime.now(),
+                    "channel_name": channel_details.get("channel_name") if channel_details else None,
+                    "profile_image_url": channel_details.get("profile_image_url") if channel_details else None,
+                    "subscriber_count": channel_details.get("subscriber_count") if channel_details else None,
+                    "description": channel_details.get("description") if channel_details else None
+                }
+
+                result = await collection.insert_one(connection_document)
+                print(f"Added channel connection to MongoDB: {result.inserted_id}")
+            
+            except Exception as mongo_error:
+                print(f"Error adding to MongoDB: {str(mongo_error)}")
         else:
             raise secret_error
         
@@ -180,6 +216,7 @@ async def get_youtube_tokens(channel_id:str):
         time_until_expiry = expires_at - current_time if not is_expired else 0
 
         if is_expired:
+            logging.getLogger("uvicorn.error").info("token expired, generating new token")
             # Token is expired, refresh it
             refresh_token = token_data.get("refresh_token")
             if not refresh_token:
@@ -240,6 +277,109 @@ async def get_youtube_tokens(channel_id:str):
 
 
 
+async def get_channel_names():
+    """
+    Get all secret names (channel IDs) from Google Secret Manager
+    """
+    try:
+        client = secretmanager.SecretManagerServiceAsyncClient(credentials=credentials)
+        project_id = os.getenv("GCP_PROJECT_ID")
+        
+        if not project_id:
+            raise Exception("GCP_PROJECT_ID environment variable is not set.")
+        
+        parent = f"projects/{project_id}"
+        
+        # List all secrets in the project
+        response = await client.list_secrets(request={"parent": parent})
+        
+        channel_names = []
+        async for secret in response:
+            # Extract secret name from the full path
+            secret_name = secret.name.split('/')[-1]
+            channel_names.append(secret_name)
+        
+        return channel_names
+        
+    except Exception as e:
+        print(f"Error retrieving channel names: {str(e)}")
+        raise e
+
+
+@app.get("/channels")
+async def get_all_channel_names():
+    """
+    API endpoint to get all available channel IDs (secret names)
+    """
+    try:
+        channel_names = await get_channel_names()
+        
+        return {
+            "status": "success",
+            "data": {
+                "channel_count": len(channel_names),
+                "channel_ids": channel_names
+            }
+        }
+        
+    except Exception as e:
+        print(f"Error retrieving channel names: {str(e)}")
+        return {
+            "status": "error",
+            "message": f"Failed to retrieve channel names: {str(e)}"
+        }
+
+
+
+async def get_youtube_channel_details_public(channel_id: str):
+    """
+    Get YouTube channel public details using YouTube Data API v3 with API key
+    """
+    api_key = os.getenv("YOUTUBE_API_KEY")  # Add this to your .env.local
+    
+    if not api_key:
+        raise Exception("YOUTUBE_API_KEY environment variable is not set.")
+    
+    url = "https://www.googleapis.com/youtube/v3/channels"
+    
+    params = {
+        "part": "snippet,statistics",
+        "id": channel_id,
+        "key": api_key
+    }
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params) as response:
+                response.raise_for_status()
+                data = await response.json()
+                
+                if not data.get("items"):
+                    return None
+                
+                channel_info = data["items"][0]
+                snippet = channel_info.get("snippet", {})
+                statistics = channel_info.get("statistics", {})
+                
+                return {
+                    "channel_id": channel_id,
+                    "channel_name": snippet.get("title"),
+                    "description": snippet.get("description"),
+                    "profile_image_url": snippet.get("thumbnails", {}).get("high", {}).get("url"),
+                    "subscriber_count": statistics.get("subscriberCount"),
+                    "video_count": statistics.get("videoCount"),
+                    "view_count": statistics.get("viewCount"),
+                    "created_date": snippet.get("publishedAt"),
+                    "country": snippet.get("country"),
+                    "custom_url": snippet.get("customUrl")
+                }
+                
+    except Exception as e:
+        print(f"Error fetching channel details: {str(e)}")
+        raise e
+
+
+import logging
 
 if __name__ == "__main__":
     import uvicorn
