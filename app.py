@@ -8,23 +8,28 @@ import requests
 import os
 from dotenv import load_dotenv
 
-from motor.motor_asyncio import AsyncIOMotorClient
+
 import pymongo
 import aiohttp
+from concurrent.futures import ThreadPoolExecutor
+import asyncio
 
 
+load_dotenv('creds/.env.local')
 # Add MongoDB connection
 MONGODB_URL = os.getenv("MONGODB_URL")
-DATABASE_NAME = os.getenv("DATABASE_NAME", "autocomment")
-COLLECTION_NAME = "channel_connections"
+DATABASE_NAME = os.getenv("MONGO_DATABASE_NAME", "yt_autocomment")
+COLLECTION_NAME = os.getenv("MONGO_COLLECTION_NAME", "channel_connections")
 
 # Initialize MongoDB client
-mongo_client = AsyncIOMotorClient(MONGODB_URL)
+mongo_client = pymongo.MongoClient(MONGODB_URL)
 database = mongo_client[DATABASE_NAME]
 collection = database[COLLECTION_NAME]
 
 
-load_dotenv('creds/.env.local')
+
+
+executor = ThreadPoolExecutor(max_workers=4)
 
 app  = FastAPI()
 
@@ -45,6 +50,7 @@ async def handle_webhook(data: TokenData):
     try:
 
         expiration_time = datetime.now().timestamp() + data.expires_in
+        data.channel_id = data.channel_id.strip()
 
         token_storage = {
             "access_token": data.access_token,
@@ -131,16 +137,21 @@ async def store_token_in_secret_manager(project_id, secret_id, access_token, ref
                 channel_details = await get_youtube_channel_details_public(secret_id)
                 
                 connection_document = {
-                    "channel_id": secret_id,
-                    "connectionCreatedOn": datetime.now(),
-                    "channel_name": channel_details.get("channel_name") if channel_details else None,
-                    "profile_image_url": channel_details.get("profile_image_url") if channel_details else None,
-                    "subscriber_count": channel_details.get("subscriber_count") if channel_details else None,
-                    "description": channel_details.get("description") if channel_details else None
+                    "channelId": secret_id,
+                    "ChannelConnectionCreatedOn": datetime.now(),
+                    "channelName": channel_details.get("channel_name") if channel_details else None,
+                    "channelProfileImageURL": channel_details.get("profile_image_url") if channel_details else None,
+                    "channelSubscriberCount": channel_details.get("subscriber_count") if channel_details else None,
+                    "channelDescriptionText": channel_details.get("description") if channel_details else None
                 }
-
-                result = await collection.insert_one(connection_document)
-                print(f"Added channel connection to MongoDB: {result.inserted_id}")
+                localChannelName = channel_details.get("channel_name") if channel_details else None
+                loop = asyncio.get_event_loop()
+                result = await loop.run_in_executor(
+                    executor, 
+                    collection.insert_one, 
+                    connection_document
+                )
+                print(f"Added new channel ** {localChannelName} ** public information to MongoDB: {result.inserted_id}")
             
             except Exception as mongo_error:
                 print(f"Error adding to MongoDB: {str(mongo_error)}")
@@ -204,6 +215,7 @@ async def refresh_youtube_token(refresh_token):
 @app.get("/tokens/youtube")
 async def get_youtube_tokens(channel_id:str):
     try:
+        channel_id = channel_id.strip()
         project_id = os.getenv("GCP_PROJECT_ID")
         secret_id = channel_id
 
